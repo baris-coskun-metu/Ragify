@@ -79,6 +79,13 @@ class Ragify:
         time_taken = time.time() - start_time
         return response, time_taken
 
+    def retrieve_chunks(self, question, top_k=5):
+        """
+        Retrieve the top-k chunks for a given question using the retriever.
+        """
+        retrieved_docs = self.retriever.retrieve(question, k=top_k)
+        return [doc.page_content for doc in retrieved_docs]
+
     def evaluate_responses(self, questions, reference_responses):
         chatbot_responses = []
         response_times = []
@@ -95,15 +102,19 @@ class Ragify:
 
         return chatbot_responses, response_times, precision_k, rouge_scores, bleu_score, rag_metrics
 
-    def calculate_precision_k(self, chatbot_responses, reference_responses, k=1):
+
+    def calculate_precision_k(self, retrieved_chunks, ground_truth_chunks, k=5):
         precisions = []
-        for i in range(len(chatbot_responses)):
-            chatbot_tokens = set(chatbot_responses[i].split())
-            reference_tokens = set(reference_responses[i].split())
-            intersection = chatbot_tokens.intersection(reference_tokens)
-            precision = len(intersection) / min(k, len(chatbot_tokens))
+        for i in range(len(retrieved_chunks)):
+
+            top_k_chunks = retrieved_chunks[i][:k]
+            relevant_chunks = ground_truth_chunks[i]
+            relevant_count = sum(1 for chunk in top_k_chunks if chunk in relevant_chunks)
+            precision = relevant_count / k
             precisions.append(precision)
+
         return {"mean": np.mean(precisions), "std": np.std(precisions)}
+
 
     def calculate_rouge_scores(self, chatbot_responses, reference_responses):
         rouge_evaluator = Rouge()
@@ -181,6 +192,10 @@ if __name__ == "__main__":
     qa_pairs = rag_pipeline.extract_qa_from_pdf(Q_path)
     questions = [qa[0] for qa in qa_pairs]
     reference_responses = [qa[1] for qa in qa_pairs]
+    ground_truth_chunks = [
+        {"Correct Chunk 1", "Correct Chunk 2"},
+        {"Correct Chunk 3"}
+    ]
 
     chatbot_responses, response_times, precision_k, rouge_scores, bleu_score, rag_metrics = rag_pipeline.evaluate_responses(questions, reference_responses)
 

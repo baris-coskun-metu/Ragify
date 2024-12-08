@@ -1,6 +1,7 @@
 import os
 import time
 import numpy as np
+import pandas as pd
 import fitz
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -19,22 +20,20 @@ class Ragify:
         self.pdf_paths = pdf_paths
         self.llm_name = llm_name
 
-
+        # Load and split documents
         self.loader = [PyPDFLoader(path) for path in self.pdf_paths]
         self.all_data = [doc for loader in self.loader for doc in loader.load()]
-
-
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         self.all_splits = self.text_splitter.split_documents(self.all_data)
 
-
-        self.local_embeddings = OllamaEmbeddings(model="mxbai-embed-large")
+        # Initialize embeddings and vectorstore
+        self.local_embeddings = OllamaEmbeddings(model="nomic-embed-text")
         self.vectorstore = FAISS.from_documents(documents=self.all_splits, embedding=self.local_embeddings)
 
-
+        # Initialize model and retriever
         self.model = ChatOllama(model=self.llm_name)
         self.rag_prompt = ChatPromptTemplate.from_template("""
-            You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. 
+            You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question.
             If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise.
 
             <context>
@@ -42,15 +41,14 @@ class Ragify:
             </context>
 
             Answer the following question:
-
             {question}""")
 
         self.retriever = self.vectorstore.as_retriever()
         self.qa_chain = (
-            {"context": self.retriever | self.format_docs, "question": RunnablePassthrough()}
-            | self.rag_prompt
-            | self.model
-            | StrOutputParser()
+                {"context": self.retriever | self.format_docs, "question": RunnablePassthrough()}
+                | self.rag_prompt
+                | self.model
+                | StrOutputParser()
         )
 
     def format_docs(self, docs):
@@ -76,7 +74,7 @@ class Ragify:
         time_taken = time.time() - start_time
         return response, time_taken
 
-    def evaluate_responses(self, questions, reference_responses):
+    def evaluate_responses(self, questions, answers, reference_responses):
         chatbot_responses = []
         response_times = []
 
@@ -86,32 +84,38 @@ class Ragify:
             response_times.append(time_taken)
 
         precision_k = self.calculate_precision_k(chatbot_responses, reference_responses, k=75)
-        rouge_scores = self.calculate_rouge_scores(chatbot_responses, reference_responses)
-        bleu_score = self.calculate_bleu_scores(chatbot_responses, reference_responses)
-        rag_metrics = self.calculate_rag_metrics(chatbot_responses, reference_responses)
+        rouge_scores = self.calculate_rouge_scores(chatbot_responses, answers)
+        bleu_score = self.calculate_bleu_scores(chatbot_responses, answers)
+        rag_metrics = self.calculate_rag_metrics(chatbot_responses, answers)
 
         return chatbot_responses, response_times, precision_k, rouge_scores, bleu_score, rag_metrics
 
     def calculate_precision_k(self, chatbot_responses, reference_responses, k=1):
         precisions = []
         for i in range(len(chatbot_responses)):
-            chatbot_tokens = set(chatbot_responses[i].split())
-            reference_tokens = set(reference_responses[i].split())
-            intersection = chatbot_tokens.intersection(reference_tokens)
-            precision = len(intersection) / min(k, len(chatbot_tokens))
+            # Extract the top-k chunks from the chatbot response
+            chatbot_chunks = chatbot_responses[i].split()[:k]  # Top-k chunks
+
+            # Ground truth chunks as a set
+            reference_chunks = set(reference_responses[i].split())
+
+            # Count the relevant items in the top-k
+            relevant_items = sum(1 for chunk in chatbot_chunks if chunk in reference_chunks)
+
+            precision = relevant_items / min(k, len(chatbot_chunks))  # Avoid division by zero
             precisions.append(precision)
+
         return {"mean": np.mean(precisions), "std": np.std(precisions)}
 
-    def calculate_rouge_scores(self, chatbot_responses, reference_responses):
+    def calculate_rouge_scores(self, chatbot_responses, answers):
         rouge_evaluator = Rouge()
         metrics = {"rouge-1": [], "rouge-2": [], "rouge-l": []}
 
-        for hyp, ref in zip(chatbot_responses, reference_responses):
+        for hyp, ref in zip(chatbot_responses, answers):
             if hyp and ref:
                 scores = rouge_evaluator.get_scores(hyp, ref, avg=False)
                 for metric in metrics.keys():
-                    metrics[metric].append(scores[0][metric])  # Appending ROUGE-1, ROUGE-2, ROUGE-L
-
+                    metrics[metric].append(scores[0][metric])
 
         return {
             metric: {
@@ -129,18 +133,18 @@ class Ragify:
             for metric in metrics
         }
 
-    def calculate_bleu_scores(self, chatbot_responses, reference_responses):
+    def calculate_bleu_scores(self, chatbot_responses, answers):
         smoothing = SmoothingFunction().method4
         scores = []
-        for hyp, ref in zip(chatbot_responses, reference_responses):
+        for hyp, ref in zip(chatbot_responses, answers):
             if hyp and ref:
                 score = sentence_bleu([ref.split()], hyp.split(), smoothing_function=smoothing)
                 scores.append(score)
         return {"mean": np.mean(scores), "std": np.std(scores)}
 
-    def calculate_rag_metrics(self, chatbot_responses, reference_responses):
+    def calculate_rag_metrics(self, chatbot_responses, answers):
         precision_scores, recall_scores, f1_scores = [], [], []
-        for chatbot_response, reference_response in zip(chatbot_responses, reference_responses):
+        for chatbot_response, reference_response in zip(chatbot_responses, answers):
             chatbot_tokens = set(chatbot_response.split())
             reference_tokens = set(reference_response.split())
 
@@ -177,20 +181,22 @@ if __name__ == "__main__":
 
     qa_pairs = rag_pipeline.extract_qa_from_pdf(Q_path)
     questions = [qa[0] for qa in qa_pairs]
-    reference_responses = [qa[1] for qa in qa_pairs]
+    answers = [qa[1] for qa in qa_pairs]
 
-    chatbot_responses, response_times, precision_k, rouge_scores, bleu_score, rag_metrics = rag_pipeline.evaluate_responses(questions, reference_responses)
+    reference_path = r"C:\Users\PoyaSystem\Desktop\Questions_Answers_ContainingParagraph.xlsx"
+    df = pd.read_excel( reference_path)
+    reference_responses = df["Containing Paragraph from the Document"].tolist()
 
+    chatbot_responses, response_times, precision_k, rouge_scores, bleu_score, rag_metrics = rag_pipeline.evaluate_responses(
+        questions, answers, reference_responses)
 
     print("Chatbot Responses and Evaluation:")
     for i, (question, chatbot_response, time_taken) in enumerate(zip(questions, chatbot_responses, response_times)):
-        print(f"Q{i+1}: {question}")
+        print(f"Q{i + 1}: {question}")
         print(f"Chatbot Response: {chatbot_response}")
-        print(f"Reference Answer: {reference_responses[i]}")
+        print(f"Reference Answer: {answers[i]}")
         print(f"Response Time: {time_taken:.4f} seconds")
         print()
-
-
 
     for rouge_type, scores in rouge_scores.items():
         print(f"{rouge_type.upper()}:")
